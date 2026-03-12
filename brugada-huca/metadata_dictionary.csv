@@ -1,0 +1,7 @@
+Variable,Description
+patient_id,An identifier for the subject
+diagnosis,The diagnosis of the subject
+sudden_death,Whether the subject has had a sudden death or not
+basal_pattern,Whether the baseline ECG is pathological or not
+brugada,The diagnosis of the subject
+
