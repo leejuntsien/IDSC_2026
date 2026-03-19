@@ -132,9 +132,25 @@ def detect_inversion(ecg_signal, waves, beat_idx):
     return None
 
 def combine_to_vcg(lead_signals_df):
-    """Combine signals from 12 leads to form a VCG."""
-    # lead_signals_df should be a DataFrame with columns like 'I', 'II', 'V1', 'V2', etc.
-    vcg = nk.ecg_vcg(lead_signals_df, method="kors")
+    """Combine signals from 12 leads to form a VCG using the Kors regression matrix."""
+    # Lead order: I, II, V1, V2, V3, V4, V5, V6
+    kors_weights = np.array([
+        [ 0.38, -0.07, -0.13,  0.05, -0.01,  0.14,  0.06,  0.54],
+        [-0.07,  0.93,  0.06, -0.02, -0.05,  0.06, -0.17,  0.13],
+        [ 0.11, -0.23, -0.43, -0.06, -0.04, -0.02, -0.10, -0.38]
+    ])
+    
+    leads = ['I', 'II', 'V1', 'V2', 'V3', 'V4', 'V5', 'V6']
+    
+    # Ensure missing leads are zeroed out (or handle gracefully)
+    for lead in leads:
+        if lead not in lead_signals_df.columns:
+            lead_signals_df[lead] = 0.0
+            
+    ecg_matrix = lead_signals_df[leads].values
+    vcg_matrix = ecg_matrix.dot(kors_weights.T)
+    
+    vcg = pd.DataFrame(vcg_matrix, columns=['VCG_x', 'VCG_y', 'VCG_z'], index=lead_signals_df.index)
     return vcg
 
 def process_single_lead(ecg_signal, sampling_rate=500):
