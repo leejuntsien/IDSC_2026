@@ -3,11 +3,12 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import GroupShuffleSplit
 
 # Import our customized pipeline scripts
 from ml_pipeline.data_loader import load_wfdb_record, extract_sequence_features
-from ml_pipeline.dl_pipeline import ECGCNN1D, ECGSequenceDataset, plot_saliency_overlay, train_epoch, evaluate
+from ml_pipeline.dl_pipeline import ECGAttentionLSTM, ECGSequenceDataset, plot_attention_overlay, train_epoch, evaluate
 
 def main():
     print("==========================================================")
@@ -25,6 +26,7 @@ def main():
     
     X_all = []
     y_all = []
+    groups_all = []
     
     print("--- 2. Extracting 12-lead Sequences & Building Dataset ---")
     for idx, row in subset_meta.iterrows():
@@ -44,20 +46,24 @@ def main():
             # X_seq shape is [num_beats, 200, 12].
             X_all.append(X_seq)
             y_all.extend([label] * len(X_seq))
+            groups_all.extend([patient_id] * len(X_seq))
         except Exception as e:
             print(f"Skipping patient {patient_id} due to error: {e}")
             
     X_all = np.vstack(X_all) # Shape: [total_beats, 200, 12]
     y_all = np.array(y_all)  # Shape: [total_beats]
+    groups_all = np.array(groups_all)
     
     print(f"Total Beats Extracted: {len(X_all)}")
     
     print("\\n--- 3. Preparing PyTorch DataLoaders ---")
     dataset = ECGSequenceDataset(X_all, y_all)
     
-    train_size = int(0.8 * len(dataset))
-    val_size = len(dataset) - train_size
-    train_ds, val_ds = random_split(dataset, [train_size, val_size])
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+    train_idx, val_idx = next(gss.split(X_all, y_all, groups=groups_all))
+    
+    train_ds = Subset(dataset, train_idx)
+    val_ds = Subset(dataset, val_idx)
     
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
@@ -65,12 +71,12 @@ def main():
     print("\\n--- 4. Initializing Explainability Model ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Input channels = 12 because we are processing the entire multi-lead ECG
-    model = ECGCNN1D(in_channels=12, num_classes=1).to(device)
+    model = ECGAttentionLSTM(input_size=12, hidden_size=64, num_layers=2, num_classes=1).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.BCEWithLogitsLoss() 
     
-    print("\\n--- 5. Training the 12-Lead CNN Model ---")
+    print("\\n--- 5. Training the 12-Lead Attention LSTM Model ---")
     epochs = 3
     for epoch in range(epochs):
         loss = train_epoch(model, train_loader, criterion, optimizer, device)
@@ -90,30 +96,19 @@ def main():
         # PyTorch expects [batch, channels, seq_len]
         sample_tensor = torch.tensor(sample_beat, dtype=torch.float32).unsqueeze(0).transpose(1, 2).to(device)
         
-        # We explicitly require gradients for the input to compute Saliency
-        sample_tensor.requires_grad_()
-        
         model.eval()
-        # Ensure we compute gradients
-        model.zero_grad()
-        logits, _ = model(sample_tensor)
-        
-        # Backpropagate to extract the numerical influence of each input sample
-        logits.backward()
-        
-        # Raw gradients -> Saliency (Take absolute magnitude)
-        # Saliency shape is [12 channels, 200 samples]
-        saliency_map_12_lead = sample_tensor.grad.abs().squeeze(0).cpu().numpy() 
+        with torch.no_grad():
+            logits, attn_weights = model(sample_tensor)
             
         prob = torch.sigmoid(logits).item()
         print(f"Evaluating 12-lead beat #{sample_idx} -> Probability of Brugada: {prob:.4f}")
         
-        # Let's plot the raw signal of Lead 0 (e.g. Lead I) mapped against its channel's gradient saliency
+        # Plot raw signal mapped against its attention weights
         signal_to_plot = sample_beat[:, 0] 
-        attn_to_plot = saliency_map_12_lead[0, :]
+        attn_to_plot = attn_weights.squeeze(0).cpu().numpy()
         
-        print("Generating precise Saliency heatmap over the identified ECG problematic segment...")
-        plot_saliency_overlay(signal_to_plot, attn_to_plot, title=f"Gradient Saliency Transparency Map (Prob: {prob:.2f})")
+        print("Generating precise Attention heatmap over the identified ECG problematic segment...")
+        plot_attention_overlay(signal_to_plot, attn_to_plot, title=f"Attention Transparency Map (Prob: {prob:.4f})")
 
 if __name__ == "__main__":
     main()

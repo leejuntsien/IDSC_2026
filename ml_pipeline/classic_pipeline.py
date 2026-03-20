@@ -5,6 +5,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, RobustScaler
 from sklearn.model_selection import StratifiedKFold, RandomizedSearchCV, learning_curve
+from sklearn.feature_selection import SelectKBest, f_classif
 from sklearn.metrics import classification_report, f1_score, average_precision_score, brier_score_loss, roc_curve, auc, precision_recall_curve
 
 from sklearn.ensemble import RandomForestClassifier, IsolationForest
@@ -75,11 +76,16 @@ def build_classic_ml_pipeline(model_name='random_forest'):
         raise ValueError(f"Model {model_name} is not supported or missing dependencies.")
 
     # Create Pipeline handling NaNs (e.g. missing U or P waves) and scaling
+    # Include a feature selection step to reduce noise and prevent overfitting
     pipeline = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', RobustScaler()), 
+        ('feature_selection', SelectKBest(score_func=f_classif)),
         ('model', model)
     ])
+    
+    # Add feature selection k as a hyperparameter to loop over
+    param_grid['feature_selection__k'] = [10, 20, 30, 'all']
     
     return pipeline, param_grid
 
@@ -105,9 +111,10 @@ def plot_learning_curve(estimator, title, X, y, cv=5):
                      train_scores_mean + train_scores_std, alpha=0.1, color="r")
     plt.fill_between(train_sizes, test_scores_mean - test_scores_std,
                      test_scores_mean + test_scores_std, alpha=0.1, color="g")
-    plt.plot(train_sizes, train_scores_mean, 'o-', color="r", label="Training score")
-    plt.plot(train_sizes, test_scores_mean, 'o-', color="g", label="Cross-validation score")
+    plt.plot(train_sizes, train_scores_mean, 'o-', color="r", label="Training Score")
+    plt.plot(train_sizes, test_scores_mean, 'o-', color="g", label="Validation (CV Test) Score")
     plt.legend(loc="lower right")
+    plt.tight_layout()
     plt.show()
 
 def compute_shap_or_importance(best_model, X_train, feature_columns=None):
@@ -124,7 +131,14 @@ def compute_shap_or_importance(best_model, X_train, feature_columns=None):
             # to feed it purely into the model object
             X_transformed = best_model.named_steps['imputer'].transform(X_train)
             X_transformed = best_model.named_steps['scaler'].transform(X_transformed)
+            X_transformed = best_model.named_steps['feature_selection'].transform(X_transformed)
             
+            # Get the retained feature names
+            support = best_model.named_steps['feature_selection'].get_support()
+            selected_features = [feature_columns[i] for i, mask in enumerate(support) if mask]
+            if not selected_features:
+                selected_features = None # Fallback
+                
             explainer = shap.TreeExplainer(model_obj)
             shap_values = explainer.shap_values(X_transformed)
             
@@ -132,7 +146,7 @@ def compute_shap_or_importance(best_model, X_train, feature_columns=None):
             if isinstance(shap_values, list):
                 shap_values = shap_values[1]
                 
-            shap.summary_plot(shap_values, X_transformed, feature_names=feature_columns)
+            shap.summary_plot(shap_values, X_transformed, feature_names=selected_features)
         except Exception as e:
             print(f"[SHAP] Error during SHAP computation: {e}. Falling back to standard importances.")
             HAS_SHAP = False # trigger fallback
@@ -140,15 +154,20 @@ def compute_shap_or_importance(best_model, X_train, feature_columns=None):
     if not HAS_SHAP and hasattr(model_obj, 'feature_importances_'):
         print("\\n[Explainability] Plotting Standard Feature Importances...")
         importances = model_obj.feature_importances_
+        
+        # Determine subset of features used
+        support = best_model.named_steps['feature_selection'].get_support()
         if feature_columns is None:
-            feature_columns = [f"Feature {i}" for i in range(len(importances))]
+            selected_features = [f"Feature {i}" for i in range(len(importances))]
+        else:
+            selected_features = [feature_columns[i] for i, mask in enumerate(support) if mask]
             
         indices = np.argsort(importances)[::-1][:15] # Top 15
         
         plt.figure(figsize=(10, 6))
         plt.title("Classic ML Feature Importances (Top 15)")
         plt.bar(range(len(indices)), importances[indices], align="center")
-        plt.xticks(range(len(indices)), [feature_columns[i] for i in indices], rotation=45, ha='right')
+        plt.xticks(range(len(indices)), [selected_features[i] for i in indices], rotation=45, ha='right')
         plt.tight_layout()
         plt.show()
 

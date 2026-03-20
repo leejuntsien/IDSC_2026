@@ -2,7 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 
 from ml_pipeline.data_loader import load_wfdb_record, extract_discrete_features, extract_sequence_features
 from ml_pipeline.classic_pipeline import train_and_evaluate
@@ -61,38 +61,79 @@ def main():
     X_seq_all_flat = np.vstack(all_raw_sequences)
     print(f"\\nTotal beats extracted: {len(df_all)}")
     
-    # 3. Train / Test Split
+    # 3. Train / Test Split (Grouped by Patient to Prevent Data Leakage)
     drop_cols = ['label', 'patient_id', 'beat_index', 'normalized_signal']
     X = df_all.drop(columns=[c for c in drop_cols if c in df_all.columns])
     y = df_all['label'].values
+    groups = df_all['patient_id'].values
     
     feature_columns = list(X.columns)
     
-    # Notice we slice the raw sequences array synchronously using the state splitter
-    X_train, X_test, y_train, y_test, seq_train, seq_test = train_test_split(
-        X.values, y, X_seq_all_flat,
-        test_size=0.30, 
-        random_state=42, 
-        stratify=y
-    )
+    # Use GroupShuffleSplit to keep all beats from the same patient in either train or test
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.30, random_state=42)
+    train_idx, test_idx = next(gss.split(X.values, y, groups))
+    
+    X_train, X_test = X.values[train_idx], X.values[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+    seq_train, seq_test = X_seq_all_flat[train_idx], X_seq_all_flat[test_idx]
     
     print(f"Train samples: {len(X_train)} | Test samples: {len(X_test)}")
     
-    # 4. Evaluate Advanced Classic ML
-    model_choice = 'lightgbm' 
-    try:
-        import lightgbm
-    except ImportError:
-        model_choice = 'random_forest'
-        
-    print(f"\\nRunning full evaluation on {model_choice}...")
-    best_model = train_and_evaluate(
-        X_train, y_train, 
-        X_test, y_test, 
-        feature_columns=feature_columns, 
-        model_name=model_choice, 
-        n_iter=5, cv=3 
-    )
+    # 4. Evaluate Advanced Classic ML Multi-Model Benchmark
+    import time
+    from sklearn.metrics import f1_score, accuracy_score
+    models_to_run = ['lightgbm', 'xgboost', 'random_forest', 'svm']
+    
+    results = []
+    best_overall_model = None
+    best_f1 = -1
+    
+    for model_choice in models_to_run:
+        print(f"\\n==================================================")
+        print(f"Running full evaluation on {model_choice}...")
+        start_time = time.time()
+        try:
+            current_model = train_and_evaluate(
+                X_train, y_train, 
+                X_test, y_test, 
+                feature_columns=feature_columns, 
+                model_name=model_choice, 
+                n_iter=5, cv=3 
+            )
+            inf_start = time.time()
+            preds = current_model.predict(X_test)
+            inf_end = time.time()
+            
+            f1 = f1_score(y_test, preds, zero_division=0)
+            acc = accuracy_score(y_test, preds)
+            
+            inf_time = inf_end - inf_start
+            total_time = inf_end - start_time
+            
+            results.append({
+                'Model': model_choice,
+                'F1 Score': f1,
+                'Accuracy': acc,
+                'Inference Time (s)': inf_time,
+                'Train+Eval Time (s)': total_time
+            })
+            
+            if f1 > best_f1:
+                best_f1 = f1
+                best_overall_model = current_model
+                
+        except Exception as e:
+            print(f"Skipping {model_choice} due to error: {e}")
+            
+    print("\\n--- Benchmark Summary ---")
+    results_df = pd.DataFrame(results)
+    print(results_df.to_string(index=False))
+    
+    best_model = best_overall_model
+    
+    if best_model is None:
+        print("No models trained successfully. Exiting.")
+        return
     
     # 5. Explainability Layer (Catching Flagged Beats vs Normal Beats)
     print("\\n--- Generating Flagged Segment Comparisons ---")
