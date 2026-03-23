@@ -49,6 +49,161 @@ METADATA_COLS = [
     'is_homogeneous',
 ]
 
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import (f1_score, matthews_corrcoef,
+                              roc_auc_score, average_precision_score,
+                              confusion_matrix)
+import pickle
+
+def run_patient_cv(df_repr, feature_columns, models_to_run, n_splits=5):
+    """
+    5-fold patient-stratified CV. Reports mean ± std per metric per model.
+    Split is at patient level — no patient appears in both train and val.
+    """
+    log.info("\n" + "="*60)
+    log.info("  5-Fold Patient-Stratified Cross-Validation")
+    log.info("="*60)
+
+    patient_ids  = df_repr['patient_id'].values
+    unique_pids  = np.unique(patient_ids)
+    patient_y    = np.array([
+        df_repr[df_repr['patient_id']==p]['label'].iloc[0]
+        for p in unique_pids
+    ]).astype(int)
+
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
+    cv_results = {m: {'sens':[], 'spec':[], 'mcc':[], 'roc_auc':[], 'pr_auc':[]}
+                  for m in models_to_run}
+
+    for fold, (train_p_idx, val_p_idx) in enumerate(skf.split(unique_pids, patient_y)):
+        train_pids = unique_pids[train_p_idx]
+        val_pids   = unique_pids[val_p_idx]
+
+        train_mask = np.isin(patient_ids, train_pids)
+        val_mask   = np.isin(patient_ids, val_pids)
+
+        X_tr = df_repr[feature_columns].values[train_mask]
+        y_tr = df_repr['label'].values[train_mask].astype(int)
+        X_vl = df_repr[feature_columns].values[val_mask]
+        y_vl = df_repr['label'].values[val_mask].astype(int)
+        pids_vl = patient_ids[val_mask]
+
+        for model_name in models_to_run:
+            try:
+                cal_model, thresh, probs, preds = train_and_evaluate(
+                    X_tr, y_tr, X_vl, y_vl,
+                    feature_columns=feature_columns,
+                    model_name=model_name,
+                    n_iter=5, cv=3,
+                )
+                # Patient-level aggregation
+                pat_df = pd.DataFrame({
+                    'patient_id': pids_vl, 'y': y_vl,
+                    'pred': preds, 'prob': probs
+                })
+                pat_agg = pat_df.groupby('patient_id').agg(
+                    y=('y','max'), pred=('pred','max'), prob=('prob','max')
+                )
+                yt = pat_agg['y'].values.astype(int)
+                yp = pat_agg['pred'].values.astype(int)
+                yb = pat_agg['prob'].values
+
+                cm = confusion_matrix(yt, yp)
+                if cm.shape == (2,2):
+                    tn,fp,fn,tp = cm.ravel()
+                    sens = tp/(tp+fn+1e-8)
+                    spec = tn/(tn+fp+1e-8)
+                else:
+                    sens = spec = 0.0
+
+                cv_results[model_name]['sens'].append(sens)
+                cv_results[model_name]['spec'].append(spec)
+                cv_results[model_name]['mcc'].append(matthews_corrcoef(yt, yp))
+                if len(np.unique(yt)) > 1:
+                    cv_results[model_name]['roc_auc'].append(roc_auc_score(yt, yb))
+                    cv_results[model_name]['pr_auc'].append(average_precision_score(yt, yb))
+            except Exception as e:
+                log.warning(f"  Fold {fold+1} {model_name}: {e}")
+
+    log.info(f"\n{'Model':<15} {'Sens':>12} {'Spec':>12} {'MCC':>12} {'ROC-AUC':>12} {'PR-AUC':>12}")
+    log.info("-" * 75)
+    cv_summary = []
+    for model_name in models_to_run:
+        r = cv_results[model_name]
+        row = {
+            'model': model_name,
+            'sens_mean':    np.mean(r['sens']),    'sens_std':    np.std(r['sens']),
+            'spec_mean':    np.mean(r['spec']),    'spec_std':    np.std(r['spec']),
+            'mcc_mean':     np.mean(r['mcc']),     'mcc_std':     np.std(r['mcc']),
+            'roc_auc_mean': np.mean(r['roc_auc']), 'roc_auc_std': np.std(r['roc_auc']),
+            'pr_auc_mean':  np.mean(r['pr_auc']),  'pr_auc_std':  np.std(r['pr_auc']),
+        }
+        cv_summary.append(row)
+        log.info(
+            f"{model_name:<15} "
+            f"{row['sens_mean']:>6.3f}±{row['sens_std']:.3f}  "
+            f"{row['spec_mean']:>6.3f}±{row['spec_std']:.3f}  "
+            f"{row['mcc_mean']:>6.3f}±{row['mcc_std']:.3f}  "
+            f"{row['roc_auc_mean']:>6.3f}±{row['roc_auc_std']:.3f}  "
+            f"{row['pr_auc_mean']:>6.3f}±{row['pr_auc_std']:.3f}"
+        )
+
+    pd.DataFrame(cv_summary).to_csv('cv_results_summary.csv', index=False)
+    log.info("Saved cv_results_summary.csv")
+    return cv_summary
+
+def save_best_model(cv_summary, df_repr, feature_columns, best_leads,
+                    output_path='models/'):
+    """
+    Identifies best model by mean MCC from CV, retrains on full dataset,
+    saves as pkl with all metadata needed for Streamlit deployment.
+    """
+    os.makedirs(output_path, exist_ok=True)
+
+    best           = max(cv_summary, key=lambda x: x['mcc_mean'])
+    best_model_name = best['model']
+    log.info(f"\n[ModelSave] Best model by CV MCC: {best_model_name} "
+             f"(MCC={best['mcc_mean']:.3f}±{best['mcc_std']:.3f})")
+
+    X_full  = df_repr[feature_columns].values
+    y_full  = df_repr['label'].values.astype(int)
+    groups_full = df_repr['patient_id'].values
+
+    from sklearn.model_selection import GroupShuffleSplit
+    gss = GroupShuffleSplit(n_splits=1, test_size=0.20, random_state=42)
+    tr_idx, cal_idx = next(gss.split(X_full, y_full, groups=groups_full))
+
+    cal_model, opt_thresh, _, _ = train_and_evaluate(
+        X_full[tr_idx], y_full[tr_idx],
+        X_full[cal_idx], y_full[cal_idx],
+        feature_columns=feature_columns,
+        model_name=best_model_name,
+        n_iter=10, cv=3,
+    )
+
+    model_package = {
+        'model':             cal_model,
+        'model_name':        best_model_name,
+        'threshold':         opt_thresh,
+        'feature_columns':   feature_columns,
+        'best_leads':        best_leads,
+        'cv_mcc_mean':       best['mcc_mean'],
+        'cv_mcc_std':        best['mcc_std'],
+        'cv_sensitivity':    best['sens_mean'],
+        'cv_specificity':    best['spec_mean'],
+        'training_date':     pd.Timestamp.now().isoformat(),
+        'n_training_patients': int(df_repr['patient_id'].nunique()),
+    }
+
+    named_path    = os.path.join(output_path, f'best_classic_{best_model_name}.pkl')
+    canonical_path = os.path.join(output_path, 'best_classic_model.pkl')
+    for p in [named_path, canonical_path]:
+        with open(p, 'wb') as f:
+            pickle.dump(model_package, f)
+    log.info(f"[ModelSave] Saved to {canonical_path}")
+    return model_package
+
+
 
 def main():
     log.info("=" * 60)
@@ -329,6 +484,58 @@ def main():
     if results_log:
         results_df = pd.DataFrame(results_log)
         log.info(f"\n{results_df.to_string(index=False)}")
+
+    # ── 8. Patient-Stratified 5-Fold CV ───────────────────────────────────────
+    cv_summary = run_patient_cv(df_repr, best_lead_cols, models_to_run)
+
+    # ── 9. Save Best Model ───────────────────────────────────────────────────
+    model_package = save_best_model(cv_summary, df_repr, best_lead_cols, best_leads)
+
+    # ── 10. Fit and Save ERSI Detector ───────────────────────────────────────
+    from ml_pipeline.ersi_detector import BrugadaERSIDetector
+
+    log.info("\n[ERSI] Loading raw V1 signals for ERSI fitting...")
+
+    # ERSI requires the full continuous V1 signal — NOT beat-segmented
+    # Use the same patient-level train/test split already computed above
+    train_patient_ids = set(str(p) for p in groups[train_idx])
+    test_patient_ids  = set(str(p) for p in groups[test_idx])
+
+    ersi_signals_train, ersi_labels_train = [], []
+    ersi_signals_test,  ersi_labels_test  = [], []
+
+    for _, row in metadata.iterrows():
+        pid   = str(row['patient_id'])
+        label = int(row['brugada'])
+        path  = f"brugada-huca/files/{pid}/{pid}"
+        if not os.path.exists(path + ".dat"):
+            continue
+        try:
+            df_s, fs_s = load_wfdb_record(path)
+            if 'V1' not in df_s.columns:
+                continue
+            v1_sig = df_s['V1'].values
+            if pid in train_patient_ids:
+                ersi_signals_train.append(v1_sig)
+                ersi_labels_train.append(label)
+            elif pid in test_patient_ids:
+                ersi_signals_test.append(v1_sig)
+                ersi_labels_test.append(label)
+        except Exception as e:
+            log.warning(f"ERSI signal load failed for {pid}: {e}")
+
+    log.info(f"[ERSI] Train: {len(ersi_signals_train)} | Test: {len(ersi_signals_test)}")
+
+    ersi_det = BrugadaERSIDetector(
+        fs=100, window_sec=2.0, step_sec=1.0, target_percentile=95
+    )
+    ersi_det.fit(ersi_signals_train, ersi_labels_train)
+
+    log.info("[ERSI] Evaluating on test set...")
+    df_ersi_eval = ersi_det.evaluate(ersi_signals_test, ersi_labels_test)
+    log.info(f"\n[ERSI] Test evaluation:\n{df_ersi_eval.to_string()}")
+    df_ersi_eval.to_csv('ersi_evaluation.csv', index=False)
+    ersi_det.save('models/ersi_detector.pkl')
 
     log.info("\nPipeline complete.")
 

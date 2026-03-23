@@ -38,6 +38,34 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+import torch
+
+def save_temporal_model(model, result, output_path='models/'):
+    os.makedirs(output_path, exist_ok=True)
+    package = {
+        'model_state_dict': model.cpu().state_dict(),
+        'model_config': {
+            'in_channels':   result['in_channels'],
+            'beat_len':      200,
+            'n_beats':       result['n_beats'],
+            'cnn_embed_dim': 64,
+            'gru_hidden':    64,
+            'dropout':       0.3,
+        },
+        'leads_mode':     result['experiment_name'],
+        'threshold':      result['optimal_threshold'],
+        'sensitivity':    result['sensitivity'],
+        'specificity':    result['specificity'],
+        'mcc':            result['mcc'],
+        'roc_auc':        result['roc_auc'],
+        'training_date':  pd.Timestamp.now().isoformat(),
+    }
+    path = os.path.join(output_path, 'best_temporal_model.pt')
+    torch.save(package, path)
+    log.info(f"[ModelSave] Temporal model saved to {path}")
+    return path
+
+
 
 def build_patient_sequences(metadata, leads_mode='right_precordial',
                              target_len=200, n_beats_window=8):
@@ -218,7 +246,7 @@ def train_temporal_model(sequences, rr_arrays, labels, in_channels,
     log.info(f"  Sensitivity: {sens:.4f}  Specificity: {spec:.4f}")
     log.info(f"  MCC: {mcc:.4f}  ROC-AUC: {roc_auc:.4f}  PR-AUC: {pr_auc:.4f}")
 
-    return {
+    return model, {
         'experiment_name': experiment_name,
         'in_channels': in_channels,
         'n_beats': n_beats,
@@ -265,18 +293,26 @@ def main():
             log.warning(f"Too few patients for {exp_name}, skipping.")
             continue
 
-        result = train_temporal_model(
+        model, result = train_temporal_model(
             sequences, rr_arrays, labels, in_channels,
             n_beats=8, epochs=15, lr=1e-3,
             experiment_name=exp_name,
         )
+        # Attach the model to the result dictionary temporarily so we can save it later
+        result['model_object'] = model
         all_results.append(result)
 
     if all_results:
-        results_df = pd.DataFrame(all_results)
+        results_df = pd.DataFrame([{k:v for k,v in r.items() if k != 'model_object'} for r in all_results])
         results_df.to_csv('dl_lead_experiment_results.csv', index=False)
         log.info(f"\n{results_df.to_string(index=False)}")
         log.info("Saved dl_lead_experiment_results.csv")
+
+        best_result = max(all_results, key=lambda x: x['mcc'])
+        # Re-train best experiment to get model object, then:
+        # In this refactored approach, we just use the model we already trained and attached
+        best_model = best_result.pop('model_object')
+        save_temporal_model(best_model, best_result)
 
     log.info("\nTemporal DL pipeline complete.")
 

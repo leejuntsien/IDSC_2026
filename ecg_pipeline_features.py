@@ -455,9 +455,10 @@ def layer1_brugada_rule(beat_features_row, leads_to_check=('V1', 'V2', 'V3')):
 def process_single_lead(ecg_signal, sampling_rate=100):
     """
     Process a single ECG lead to extract beat-by-beat numerical features.
-    Now includes ST elevation features from extract_st_features.
+    Bad individual beats are skipped rather than crashing the whole record.
+    Returns (DataFrame, n_skipped_beats).
     """
-    min_samples = int(2.0 * sampling_rate)  # at least 2 seconds
+    min_samples = int(2.0 * sampling_rate)
     if len(ecg_signal) < min_samples:
         raise ValueError(
             f"Signal too short: {len(ecg_signal)} samples "
@@ -465,42 +466,50 @@ def process_single_lead(ecg_signal, sampling_rate=100):
         )
 
     ecg_clean = apply_notch_filter(ecg_signal, sampling_rate)
-    rpeaks = detect_peaks(ecg_clean, sampling_rate)
+    rpeaks    = detect_peaks(ecg_clean, sampling_rate)
+    waves     = delineate_segments(ecg_clean, rpeaks, sampling_rate)
+    waves['ECG_R_Peaks'] = rpeaks
 
-    waves = delineate_segments(ecg_clean, rpeaks, sampling_rate)
-    waves['ECG_R_Peaks'] = rpeaks  # Inject for convenience
-
-    segments = segment_beats_by_rr(ecg_clean, rpeaks, sampling_rate)
+    segments  = segment_beats_by_rr(ecg_clean, rpeaks, sampling_rate)
 
     beat_features = []
+    n_skipped     = 0
+
     for seg in segments:
-        idx = seg['beat_idx']
+        idx    = seg['beat_idx']
         r1_idx = seg['start_idx']
         r2_idx = seg['end_idx']
-        v_norm = normalize_voltage(seg['signal'], ecg_clean, r1_idx, r2_idx)
 
-        diffs = extract_segment_differences(waves, ecg_clean, idx, sampling_rate)
-        qrs = extract_qrs_time(waves, idx, sampling_rate)
-        st = extract_st_segment(waves, idx, sampling_rate)
-        has_u, u_idx = detect_u_waves(ecg_clean, waves, idx, sampling_rate)
-        invert = detect_inversion(ecg_clean, waves, idx)
-
-        # NEW: ST elevation features
-        st_feats = extract_st_features(ecg_clean, waves, idx, sampling_rate)
+        try:
+            v_norm   = normalize_voltage(seg['signal'], ecg_clean, r1_idx, r2_idx)
+            diffs    = extract_segment_differences(waves, ecg_clean, idx, sampling_rate)
+            qrs      = extract_qrs_time(waves, idx, sampling_rate)
+            st       = extract_st_segment(waves, idx, sampling_rate)
+            has_u, _ = detect_u_waves(ecg_clean, waves, idx, sampling_rate)
+            invert   = detect_inversion(ecg_clean, waves, idx)
+            st_feats = extract_st_features(ecg_clean, waves, idx, sampling_rate)
+        except Exception:
+            n_skipped += 1
+            continue
 
         beat_params = {
-            "beat_index": idx,
-            "period_s": seg['period_s'],
-            "QRS_duration_s": qrs,
-            "ST_segment_s": st,
-            "has_U_wave": has_u,
+            "beat_index":       idx,
+            "period_s":         seg['period_s'],
+            "QRS_duration_s":   qrs,
+            "ST_segment_s":     st,
+            "has_U_wave":       has_u,
             "T_wave_inversion": invert,
         }
         beat_params.update(diffs)
         beat_params.update(st_feats)
         beat_features.append(beat_params)
 
-    return pd.DataFrame(beat_features)
+    if not beat_features:
+        raise ValueError(
+            f"All {len(segments)} beats failed extraction — record unusable."
+        )
+
+    return pd.DataFrame(beat_features), n_skipped
 
 
 if __name__ == "__main__":

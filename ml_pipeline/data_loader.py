@@ -54,8 +54,12 @@ def extract_discrete_features(lead_signals_df, fs, patient_id,
 
         signal = lead_signals_df[lead].values
         try:
-            df_features = epf.process_single_lead(signal, sampling_rate=fs)
-        except Exception:
+            # ── FIX 1: unpack tuple (df, n_skipped) ──────────────────────
+            df_features, n_skipped = epf.process_single_lead(signal, sampling_rate=fs)
+            if n_skipped > 0:
+                print(f"  [{lead}] skipped {n_skipped}/{n_skipped + len(df_features)} beats")
+        except Exception as e:
+            print(f"  [{lead}] failed entirely: {e}")
             continue
 
         if len(df_features) == 0:
@@ -76,10 +80,19 @@ def extract_discrete_features(lead_signals_df, fs, patient_id,
             f"{target_leads} yielded features."
         )
 
-    # Merge all DataFrames on beat_index and period_s
+    # ── FIX 2: outer join on beat_index only ─────────────────────────────
+    # Inner join on period_s was dropping beats that succeeded in some leads
+    # but failed in others, leaving only ~1-2 beats per patient.
+    # period_s lives only in the first lead's columns after this merge.
     merged_df = all_leads_features[0]
     for df in all_leads_features[1:]:
-        merged_df = pd.merge(merged_df, df, on=['beat_index', 'period_s'], how='inner')
+        # Drop period_s from right df to avoid _x/_y duplicates
+        df = df.drop(columns=['period_s'], errors='ignore')
+        merged_df = pd.merge(
+            merged_df, df,
+            on='beat_index',
+            how='outer'   # keep beats even if a lead failed for that beat
+        )
 
     # Insert traceability columns
     merged_df.insert(0, 'patient_id', patient_id)
