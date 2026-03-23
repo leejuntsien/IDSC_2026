@@ -1,56 +1,94 @@
 """
-migrate_model.py — Extract model predictions to version-agnostic format.
-Run once in the training environment, then the app uses the migrated version.
+migrate_model.py — Patches sklearn version mismatch and saves prob_cache.
 """
 import pickle
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.impute import SimpleImputer
 
-# Load the original PKL (works in training env)
+# Monkey-patch for sklearn 1.5.1 → 1.8.0 attribute rename
+_SI_orig = SimpleImputer.__getattribute__
+def _si_compat(self, name):
+    if name == '_fill_dtype':
+        try:
+            return _SI_orig(self, '_fill_dtype')
+        except AttributeError:
+            return _SI_orig(self, '_fit_dtype')
+    return _SI_orig(self, name)
+SimpleImputer.__getattribute__ = _si_compat
+
+# ── Step 1: Load PKL (will warn about version mismatch — that's expected) ────
 with open('models/best_classic_model.pkl', 'rb') as f:
     pkg = pickle.load(f)
 
-# Load the full feature cache
-df_all = pd.read_csv('extracted_features_all_leads.csv')
-feature_columns = pkg['feature_columns']
+# ── Step 2: Patch all SimpleImputer objects in the nested pipeline ────────────
+# sklearn 1.8.0 renamed _fill_dtype → _fit_dtype
+# Walk the entire object tree and fix any imputer missing the new attribute
 
-# Rebuild the representative dataset to get X_full
+def patch_imputers(obj, visited=None):
+    if visited is None:
+        visited = set()
+    obj_id = id(obj)
+    if obj_id in visited:
+        return
+    visited.add(obj_id)
+
+    if isinstance(obj, SimpleImputer):
+        if hasattr(obj, '_fill_dtype') and not hasattr(obj, '_fit_dtype'):
+            obj._fit_dtype = obj._fill_dtype
+            print(f"  Patched SimpleImputer: _fill_dtype → _fit_dtype")
+        elif not hasattr(obj, '_fit_dtype'):
+            # Neither exists — set a safe default
+            obj._fit_dtype = np.float64
+            print(f"  Patched SimpleImputer: added _fit_dtype = np.float64")
+
+    # Recurse into common sklearn container attributes
+    for attr in ['steps', 'calibrated_classifiers_', 'estimators_',
+                 'estimator', 'base_estimator']:
+        child = getattr(obj, attr, None)
+        if child is None:
+            continue
+        if isinstance(child, list):
+            for item in child:
+                if hasattr(item, '__dict__'):
+                    patch_imputers(item, visited)
+                # Handle (name, estimator) tuples from Pipeline.steps
+                if isinstance(item, tuple) and len(item) == 2:
+                    patch_imputers(item[1], visited)
+        elif hasattr(child, '__dict__'):
+            patch_imputers(child, visited)
+
+print("Patching SimpleImputer attributes...")
+patch_imputers(pkg['model'])
+print("Patching complete.")
+
+# ── Step 3: Verify the patch works ───────────────────────────────────────────
+print("Testing model.predict_proba on dummy data...")
+try:
+    dummy = np.zeros((1, len(pkg['feature_columns'])))
+    _ = pkg['model'].predict_proba(dummy)
+    print("predict_proba test PASSED.")
+    patch_ok = True
+except Exception as e:
+    print(f"predict_proba still failing: {e}")
+    patch_ok = False
+
+# ── Step 4: Build prob_cache using patched model ──────────────────────────────
 from ml_pipeline.beat_selector import build_representative_dataset
+
+df_all  = pd.read_csv('extracted_features_all_leads.csv')
 df_repr = build_representative_dataset(df_all)
 
-X_full  = df_repr[feature_columns].apply(pd.to_numeric, errors='coerce').fillna(0).values
-y_full  = df_repr['label'].values.astype(int)
-pids    = df_repr['patient_id'].values
+feature_columns = pkg['feature_columns']
+available = [c for c in feature_columns if c in df_repr.columns]
+X_full    = df_repr[feature_columns].apply(pd.to_numeric, errors='coerce').fillna(0).values
+y_full    = df_repr['label'].values.astype(int)
+pids      = df_repr['patient_id'].values
 
-# Extract the underlying model in a sklearn-version-agnostic way
-# For tree ensembles: extract the trees themselves as ONNX or just save probabilities
-# Simplest robust option: save as ONNX
-# Replace the try/except in migrate_model.py with this:
 pkg_migrated = {k: v for k, v in pkg.items() if k != 'model'}
 
-try:
-    from skl2onnx import convert_sklearn
-    from skl2onnx.common.data_types import FloatTensorType
-    import onnx
-
-    inner = pkg['model']
-    if hasattr(inner, 'calibrated_classifiers_'):
-        inner = inner.calibrated_classifiers_[0].estimator
-
-    n_features = X_full.shape[1]
-    initial_type = [('float_input', FloatTensorType([None, n_features]))]
-    onnx_model = convert_sklearn(inner, initial_types=initial_type, target_opset=17)
-
-    with open('models/best_classic_model.onnx', 'wb') as f:
-        onnx.save(onnx_model, f)
-
-    pkg_migrated['model_format'] = 'onnx'
-    pkg_migrated['model_path']   = 'models/best_classic_model.onnx'
-    print("ONNX migration successful.")
-
-except Exception as e:
-    print(f"ONNX failed ({e}), saving prob_cache instead.")
+if patch_ok:
+    print("Generating probability cache from patched model...")
     probs_full = pkg['model'].predict_proba(X_full)[:, 1]
     pkg_migrated['model_format'] = 'prob_cache'
     pkg_migrated['prob_cache']   = {
@@ -59,8 +97,15 @@ except Exception as e:
         'patient_ids':     pids,
         'feature_columns': feature_columns,
     }
+    print(f"Probability cache built: {len(probs_full)} samples, "
+          f"mean prob={probs_full.mean():.4f}")
+else:
+    # Last resort — save patched model directly and hope 1.8.0 tolerates it
+    pkg_migrated['model']        = pkg['model']
+    pkg_migrated['model_format'] = 'sklearn_patched'
+    print("Saving patched sklearn model directly.")
 
-# Always save — regardless of which path succeeded
 with open('models/best_classic_model_migrated.pkl', 'wb') as f:
     pickle.dump(pkg_migrated, f)
-print(f"Saved migrated model (format: {pkg_migrated['model_format']})")
+print(f"Saved: models/best_classic_model_migrated.pkl "
+      f"(format: {pkg_migrated['model_format']})")

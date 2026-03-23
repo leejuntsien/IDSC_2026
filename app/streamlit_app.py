@@ -31,6 +31,19 @@ st.set_page_config(
     layout="wide",
 )
 
+from sklearn.impute import SimpleImputer
+
+# Monkey-patch for sklearn 1.5.1 → 1.8.0 attribute rename
+_SI_orig = SimpleImputer.__getattribute__
+def _si_compat(self, name):
+    if name == '_fill_dtype':
+        try:
+            return _SI_orig(self, '_fill_dtype')
+        except AttributeError:
+            return _SI_orig(self, '_fit_dtype')
+    return _SI_orig(self, name)
+SimpleImputer.__getattribute__ = _si_compat
+
 # ── Model loaders (cached) ────────────────────────────────────────────────────
 @st.cache_resource
 def load_classic_model():
